@@ -2,138 +2,349 @@
 
 #==============================================================================
 # Unified ntfy Monitoring Script for Proxmox/Linux Infrastructure
-# Monitors: PVE, SMART, Backups, System Errors, VM Network
+# Monitors: Guest networking and log files
 #==============================================================================
 
 # Configuration
 STATE_DIR="/var/lib/ntfy-monitor"
 CONFIG_FILE="/etc/ntfy-monitor.conf"
 ERROR_LOG_FILE="/var/log/ntfy-monitor_errors.log"
+LOCK_FILE="/var/run/ntfy-monitor.lock"
 
 # Create state directory
 mkdir -p "$STATE_DIR"
 
-# Default configuration (can be overridden in config file) in /etc/ntfy-monitor.conf
-CPU_TEMP_THRESHOLD=80
-MEM_USAGE_THRESHOLD=90
-LOAD_THRESHOLD_MULTIPLIER=1.5
-SMART_TEMP_THRESHOLD=50
+# Default configuration (can be overridden in config file)
 GUEST_PING_TIMEOUT=5
 GUEST_PING_RETRY_COUNT=2
+CHECK_LOG_INTERVAL_HOURS=1  # Time window for log checks
+PING_TARGETS="8.8.8.8 1.1.1.1"
+NSLOOKUP_TARGET="google.com"
 
 NTFY_SERVER=""
 NTFY_BASE_TOPIC=""
 NTFY_USER=""
 NTFY_PASS=""
 
-BACKUP_LOG_PATHS="/var/log/backup*.log"
-CHECK_INTERVAL_HOURS=1
-
-ENABLE_BACKUP_MONITORING=true
-ENABLE_SYSTEM_MONITORING=true
-ENABLE_GUEST_NETWORK_MONITORING=true
-ENABLE_HOST_LOGS_MONITORING=true
-ENABLE_GUEST_LOGS_MONITORING=true
-ENABLE_DISK_HEALTH_MONITORING=true
-
 DEBUG=false
+TIMEOUT_GUEST_OPERATIONS=30
+MAX_PARALLEL_JOBS=10
 
 # Load configuration if it exists
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 #==============================================================================
+# Lock Management
+#==============================================================================
+
+acquire_lock() {
+    exec {LOCK_FD}>"$LOCK_FILE"
+    if ! flock -n $LOCK_FD; then
+        error_log_message "Another instance is running"
+        exit 1
+    fi
+    echo $$ >&$LOCK_FD
+}
+
+release_lock() {
+    if [ -n "$LOCK_FD" ]; then
+        flock -u $LOCK_FD
+        exec {LOCK_FD}>&-
+    fi
+    rm -f "$LOCK_FILE" 2>/dev/null
+}
+
+# Ensure lock is released on exit
+trap release_lock EXIT
+
+#==============================================================================
 # Utility Functions
 #==============================================================================
 
-check_guest_logs() {
-    local vmid="$1"
-    local last_check="$2"
-    local guest_type="$3"  # "ct" or "qemu"
-    local name=""
-    
-    # Get guest name
-    if [ "$guest_type" = "ct" ]; then
-        name=$(pct list | awk -v id="$vmid" '$1==id {print $3}')
-    elif [ "$guest_type" = "qemu" ]; then
-        name=$(qm list | awk -v id="$vmid" '$1==id {print $3}')
-    else
-        echo "Unknown guest type: $guest_type"
+check_network_tools() {
+    local ID=$1
+    local TYPE=$2 # vm or ct
+    local IS_WINDOWS=$3 # 1 for Windows, 0 for Linux
+
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        error_log_message "$TYPE $ID: Windows VM - network checks not supported."
+        send_notification "default" "$TYPE $ID Skipped" "$TYPE $ID ($NAME): Windows VM - network checks not supported." "guest-network" "warning,$TYPE,$NAME"
         return 1
     fi
 
-    local errors=""
-    if [ "$guest_type" = "ct" ]; then
-        if pct_command_exists "$vmid" journalctl; then
-            errors=$(pct_safe_exec "$vmid" "journalctl --since '$last_check' --priority=err --no-pager -q | head -20")
-        else
-            for logfile in /var/log/syslog /var/log/messages; do
-                if pct_safe_exec "$vmid" "[ -f $logfile ]"; then
-                    errors=$(pct_safe_exec "$vmid" "awk -v d='$last_check' '\$0 >= d' $logfile | grep -i 'error\|fail\|abort' | tail -20")
-                    [ ! -z "$errors" ] && break
-                fi
-            done
-        fi
+    # Check for ping
+    if [ "$TYPE" = "vm" ]; then
+        PING_CHECK=$(qm guest exec $ID -- sh -c "command -v ping" 2>/dev/null)
+        PING_EXIT=$?
     else
-        if qm_command_exists "$vmid" journalctl; then
-            errors=$(qm_safe_exec "$vmid" "journalctl --since '$last_check' --priority=err --no-pager -q | head -20")
-        else
-            for logfile in /var/log/syslog /var/log/messages; do
-                if qm_safe_exec "$vmid" "[ -f $logfile ]"; then
-                    errors=$(qm_safe_exec "$vmid" "awk -v d='$last_check' '\$0 >= d' $logfile | grep -i 'error\|fail\|abort' | tail -20")
-                    [ ! -z "$errors" ] && break
-                fi
-            done
-        fi
+        PING_CHECK=$(pct exec $ID -- sh -c "command -v ping" 2>/dev/null)
+        PING_EXIT=$?
+    fi
+    
+    if [ $PING_EXIT -ne 0 ] || [ -z "$PING_CHECK" ]; then
+        error_log_message "$TYPE $ID: ping not found"
+        send_notification "urgent" "$TYPE $ID Tool Missing" "$TYPE $ID ($NAME): ping not found." "guest-network" "error,$TYPE,$NAME"
+        return $PING_EXIT
     fi
 
-    [ ! -z "$errors" ] && send_notification "high" "Guest Log Errors ($name)" "$errors" "guest_logs" "logs,error"
+    # Check for nslookup
+    if [ "$TYPE" = "vm" ]; then
+        NSLOOKUP_CHECK=$(qm guest exec $ID -- sh -c "command -v nslookup" 2>/dev/null)
+        NSLOOKUP_EXIT=$?
+    else
+        NSLOOKUP_CHECK=$(pct exec $ID -- sh -c "command -v nslookup" 2>/dev/null)
+        NSLOOKUP_EXIT=$?
+    fi
+    
+    if [ $NSLOOKUP_EXIT -ne 0 ] || [ -z "$NSLOOKUP_CHECK" ]; then
+        error_log_message "$TYPE $ID: nslookup not found"
+        send_notification "urgent" "$TYPE $ID Tool Missing" "$TYPE $ID ($NAME): nslookup not found." "guest-network" "error,$TYPE,$NAME"
+        return $NSLOOKUP_EXIT
+    fi
+    
+    return 0
 }
 
-check_guest_network() {
-    local vmid="$1"
-    local guest_type="$2"  # "ct" or "qemu"
-    local name=""
-    local targets=(1.1.1.1 8.8.8.8)
-    local dns_domain="www.google.com"
+check_log_tools() {
+    local ID=$1
+    local TYPE=$2 # vm or ct
+    local IS_WINDOWS=$3 # 1 for Windows, 0 for Linux
 
-    # Get guest name
-    if [ "$guest_type" = "ct" ]; then
-        name=$(pct list | awk -v id="$vmid" '$1==id {print $3}')
-    elif [ "$guest_type" = "qemu" ]; then
-        name=$(qm list | awk -v id="$vmid" '$1==id {print $3}')
-    else
-        echo "Unknown guest type: $guest_type"
-        return 1
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        return 1  # Handled in check_guest_logs
     fi
 
-    # Ping targets
-    for target in "${targets[@]}"; do
-        if [ "$guest_type" = "ct" ]; then
-            pct_safe_exec "$vmid" "ping -c $GUEST_PING_RETRY_COUNT -W $GUEST_PING_TIMEOUT $target" >/dev/null 2>&1 \
-                || send_notification "high" "VM Network Unreachable ($name)" "Failed to ping $target" "guest_network" "network,$name"
+    # Check for grep and awk
+    for tool in grep awk; do
+        if [ "$TYPE" = "vm" ]; then
+            TOOL_CHECK=$(qm guest exec $ID -- sh -c "command -v $tool" 2>/dev/null)
+            TOOL_EXIT=$?
         else
-            qm_safe_exec "$vmid" "ping -c $GUEST_PING_RETRY_COUNT -W $GUEST_PING_TIMEOUT $target" >/dev/null 2>&1 \
-                || send_notification "high" "VM Network Unreachable ($name)" "Failed to ping $target" "guest_network" "network,$name"
+            TOOL_CHECK=$(pct exec $ID -- sh -c "command -v $tool" 2>/dev/null)
+            TOOL_EXIT=$?
+        fi
+        
+        if [ $TOOL_EXIT -ne 0 ] || [ -z "$TOOL_CHECK" ]; then
+            error_log_message "$TYPE $ID: $tool not found"
+            send_notification "urgent" "$TYPE $ID Tool Missing" "$TYPE $ID ($NAME): $tool not found." "guest-logs" "error,$TYPE,$NAME"
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+check_guest_logs() {
+    local VMID=$1
+    local NODE=$2
+    local NAME=$3
+    local TYPE=$4 # vm or ct
+    local IS_WINDOWS=$5
+    local LAST_CHECK=$6
+
+    debug_log_message "Checking logs for $TYPE $VMID ($NAME) on node $NODE..."
+
+    # Skip Windows VMs
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        debug_log_message "  $TYPE $VMID: Windows guest - log checking not supported."
+        send_notification "default" "$TYPE $VMID Skipped" "$TYPE $VMID ($NAME): Windows guest - log checking not supported." "guest-logs" "warning,$TYPE,$NAME"
+        return
+    fi
+
+    # For VMs, check guest agent
+    if [ "$TYPE" = "vm" ]; then
+        AGENT_PING=$(qm agent $VMID ping 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            debug_log_message "  $TYPE $VMID: QEMU Guest Agent unavailable - skipping checks."
+            send_notification "urgent" "$TYPE $VMID Agent Unavailable" "$TYPE $VMID ($NAME): QEMU Guest Agent unavailable." "guest-logs" "error,$TYPE,$NAME"
+            return
+        fi
+    fi
+
+    # Check log tools
+    check_log_tools "$VMID" "$TYPE" "$IS_WINDOWS" || return
+
+    # Define log files to check (syslog or messages)
+    local LOG_FILES="/var/log/syslog /var/log/messages"
+    local LOG_FILE=""
+    local CHECK_CMD=""
+
+    # Find an existing log file
+    for file in $LOG_FILES; do
+        if [ "$TYPE" = "vm" ]; then
+            CHECK_CMD=$(qm guest exec $VMID -- [ -f $file ] && echo exists 2>/dev/null)
+            if echo "$CHECK_CMD" | grep -q "exists"; then
+                LOG_FILE=$file
+                break
+            fi
+        else
+            CHECK_CMD=$(pct exec $VMID -- [ -f $file ] && echo exists 2>/dev/null)
+            if echo "$CHECK_CMD" | grep -q "exists"; then
+                LOG_FILE=$file
+                break
+            fi
         fi
     done
 
-    # DNS check
-    if [ "$guest_type" = "ct" ]; then
-        pct_safe_exec "$vmid" "nslookup $dns_domain" >/dev/null 2>&1 \
-                || send_notification "high" "VM DNS Failure ($name)" "DNS lookup failed" "guest_network" "dns,$name"
-    else
-        qm_safe_exec "$vmid" "nslookup $dns_domain" >/dev/null 2>&1 \
-            || send_notification "high" "VM DNS Failure ($name)" "DNS lookup failed" "guest_network" "dns,$name"
+    if [ -z "$LOG_FILE" ]; then
+        debug_log_message "  $TYPE $VMID: No supported log file found ($LOG_FILES)."
+        send_notification "urgent" "$TYPE $VMID Log Missing" "$TYPE $VMID ($NAME): No supported log file found ($LOG_FILES)." "guest-logs" "error,$TYPE,$NAME"
+        return
+    fi
 
+    debug_log_message "  $TYPE $VMID: Checking $LOG_FILE since $LAST_CHECK..."
+
+    # Convert LAST_CHECK to epoch for comparison
+    LAST_CHECK_EPOCH=$(date -d "$LAST_CHECK" +%s 2>/dev/null || echo 0)
+    if [ "$LAST_CHECK_EPOCH" -eq 0 ]; then
+        error_log_message "$TYPE $VMID: Invalid LAST_CHECK timestamp ($LAST_CHECK)"
+        return
+    fi
+
+    # Grep for errors and filter by timestamp
+    local ERROR_PATTERNS="error|failed|failure|crash|critical|panic"
+    local LOG_CHECK=""
+    if [ "$TYPE" = "vm" ]; then
+        LOG_CHECK=$(qm guest exec $VMID -- grep -i -E $ERROR_PATTERNS $LOG_FILE 2>&1)
+    else
+        LOG_CHECK=$(pct exec $VMID -- grep -i -E $ERROR_PATTERNS $LOG_FILE 2>&1)
+    fi
+    local LOG_EXIT=$?
+
+    if [ $LOG_EXIT -ne 0 ]; then
+        debug_log_message "  $TYPE $VMID: Failed to read logs - $LOG_CHECK"
+        send_notification "urgent" "$TYPE $VMID Log Access Error" "$TYPE $VMID ($NAME): Failed to read $LOG_FILE - $LOG_CHECK" "guest-logs" "error,$TYPE,$NAME"
+        return
+    fi
+
+    # Filter logs by timestamp
+    local ERRORS=""
+    if [ -n "$LOG_CHECK" ]; then
+        ERRORS=$(echo "$LOG_CHECK" | while IFS= read -r line; do
+            LOG_TIME=$(echo "$line" | awk '{print $1 " " $2 " " $3}' | grep -E "[A-Za-z]{3} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
+            if [ -n "$LOG_TIME" ]; then
+                LOG_TIMESTAMP=$(date -d "$LOG_TIME" '+%s' 2>/dev/null)
+                if [ -n "$LOG_TIMESTAMP" ] && [ "$LOG_TIMESTAMP" -gt "$LAST_CHECK_EPOCH" ]; then
+                    echo "$line"
+                fi
+            fi
+        done)
+    fi
+
+    # Report errors if found
+    if [ -n "$ERRORS" ]; then
+        debug_log_message "  $TYPE $VMID: Issues found in logs since $LAST_CHECK."
+        local ERROR_COUNT=$(echo "$ERRORS" | wc -l)
+        local MESSAGE="Issues in $TYPE $VMID ($NAME) logs ($LOG_FILE, $ERROR_COUNT errors):\n$ERRORS"
+        send_notification "urgent" "$TYPE $VMID Log Issues" "$MESSAGE" "guest-logs" "warning,$TYPE,$NAME"
+    else
+        debug_log_message "  $TYPE $VMID: No issues found in logs since $LAST_CHECK."
     fi
 }
 
-error_log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$ERROR_LOG_FILE"
+check_guest_network() {
+    local VMID=$1
+    local NODE=$2
+    local NAME=$3
+    local TYPE=$4 # vm or ct
+    local IS_WINDOWS=$5 # 1 for Windows, 0 for Linux
+
+    debug_log_message "Checking $TYPE $VMID ($NAME) on node $NODE..."
+
+    # For VMs, check guest agent
+    if [ "$TYPE" = "vm" ]; then
+        AGENT_PING=$(qm agent $VMID ping 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            debug_log_message "  $TYPE $VMID: QEMU Guest Agent unavailable - skipping checks."
+            send_notification "urgent" "$TYPE $VMID Agent Unavailable" "$TYPE $VMID ($NAME): QEMU Guest Agent unavailable." "guest-network" "error,$TYPE,$NAME"
+            return
+        fi
+    fi
+
+    # Check and install tools (skip for Windows)
+    check_network_tools "$VMID" "$TYPE" "$IS_WINDOWS" || return
+
+    # Ping check with multiple targets
+    local PING_SUCCESS=0
+    local target
+    
+    for target in $PING_TARGETS; do
+        debug_log_message "  $TYPE $VMID: Pinging $target..."
+        local PING_RESULT=""
+        local PING_EXIT=0
+
+        if [ "$TYPE" = "vm" ] && [ "$IS_WINDOWS" -eq 1 ]; then
+            # Windows: Use loop for ping -n
+            local attempt=0
+            while [ $attempt -lt $GUEST_PING_RETRY_COUNT ]; do
+                PING_RESULT=$(qm guest exec $VMID -- cmd /c ping -n 1 -w $((GUEST_PING_TIMEOUT*1000)) $target 2>&1)
+                PING_EXIT=$?
+                if [ $PING_EXIT -eq 0 ] && echo "$PING_RESULT" | grep -q "Reply from"; then
+                    PING_SUCCESS=1
+                    break
+                fi
+                attempt=$((attempt + 1))
+                debug_log_message "  $TYPE $VMID: Ping attempt $attempt to $target failed - $PING_RESULT"
+                sleep 1
+            done
+        else
+            # Linux: Use ping -c
+            if [ "$TYPE" = "vm" ]; then
+                PING_RESULT=$(qm guest exec $VMID -- ping -c $GUEST_PING_RETRY_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
+                PING_EXIT=$?
+            else
+                PING_RESULT=$(pct exec $VMID -- ping -c $GUEST_PING_RETRY_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
+                PING_EXIT=$?
+            fi
+            if [ $PING_EXIT -eq 0 ] && echo "$PING_RESULT" | grep -q "1 packets transmitted, 1 received\|[1-9][0-9]* received"; then
+                PING_SUCCESS=1
+            else
+                debug_log_message "  $TYPE $VMID: Ping to $target failed - $PING_RESULT"
+            fi
+        fi
+
+        if [ $PING_SUCCESS -eq 1 ]; then
+            debug_log_message "  $TYPE $VMID: Ping SUCCESS to $target"
+            break
+        fi
+    done
+
+    if [ $PING_SUCCESS -eq 0 ]; then
+        debug_log_message "  $TYPE $VMID: Ping FAILED to all targets ($PING_TARGETS)"
+        send_notification "urgent" "$TYPE $VMID Ping Failed" "$TYPE $VMID ($NAME): Ping to all targets ($PING_TARGETS) failed - $PING_RESULT" "guest-network" "error,$TYPE,$NAME"
+    fi
+
+    # Nslookup check
+    if [ "$TYPE" = "vm" ]; then
+        if [ "$IS_WINDOWS" -eq 1 ]; then
+            NSLOOKUP_RESULT=$(qm guest exec $VMID -- cmd /c nslookup $NSLOOKUP_TARGET 2>&1)
+        else
+            NSLOOKUP_RESULT=$(qm guest exec $VMID -- nslookup $NSLOOKUP_TARGET 2>&1)
+        fi
+        NSLOOKUP_EXIT=$?
+    else
+        NSLOOKUP_RESULT=$(pct exec $VMID -- nslookup $NSLOOKUP_TARGET 2>&1)
+        NSLOOKUP_EXIT=$?
+    fi
+
+    if [ $NSLOOKUP_EXIT -eq 0 ] && echo "$NSLOOKUP_RESULT" | grep -q "Name:.*$NSLOOKUP_TARGET"; then
+        debug_log_message "  $TYPE $VMID: Nslookup SUCCESS"
+    else
+        debug_log_message "  $TYPE $VMID: Nslookup FAILED - $NSLOOKUP_RESULT"
+        send_notification "urgent" "$TYPE $VMID Nslookup Failed" "$TYPE $VMID ($NAME): Nslookup of $NSLOOKUP_TARGET failed - $NSLOOKUP_RESULT" "guest-network" "error,$TYPE,$NAME"
+    fi
 }
 
-debug_log() {
-    [ "$DEBUG" = "true" ] && echo "DEBUG: $1"
+log_message() {
+    echo "$(get_timestamp) - $1" | tee -a "$ERROR_LOG_FILE"
+}
+
+error_log_message() {
+    echo "[$(get_timestamp)] $1" | tee -a "$ERROR_LOG_FILE"
+}
+
+debug_log_message() {
+    [ "$DEBUG" = "true" ] && echo "DEBUG: $(date '+%H:%M:%S') $1"
 }
 
 validate_config() {
@@ -144,13 +355,17 @@ validate_config() {
 }
 
 check_dependencies() {
-    local deps=("curl" "smartctl" "journalctl" "pvesh" "pct" "qm" "zpool" "awk" "grep" "bc" "date" "sensors" "free" "lsblk")
+    local deps=("curl" "jq" "awk" "grep" "date" "pvesh" "pct" "qm")
+    local missing_deps=()
+    
     for dep in "${deps[@]}"; do
-        command -v "$dep" >/dev/null 2>&1 || {
-            error_log_message "Required dependency $dep not found"
-            exit 1
-        }
+        command -v "$dep" >/dev/null 2>&1 || missing_deps+=("$dep")
     done
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        error_log_message "Missing required dependencies: ${missing_deps[*]}"
+        exit 1
+    fi
 }
 
 send_notification() {
@@ -161,31 +376,35 @@ send_notification() {
     local tags="${5:-$(hostname)}"
     local click_url="$6"
     
+    topic=$(echo "$topic" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
     local full_topic="${NTFY_BASE_TOPIC}-${topic}"
-    local headers="Title: $title"
-    headers="$headers\nPriority: $priority"
-    headers="$headers\nTags: $tags"
     
-    [ ! -z "$click_url" ] && headers="$headers\nClick: $click_url"
+    if [ ${#message} -gt 1000 ]; then
+        message="${message:0:997}..."
+    fi
     
-    debug_log "Sending notification: $title"
+    local curl_args=(-s -f --max-time 10)
+    local headers="Title: $title"$'\n'"Priority: $priority"$'\n'"Tags: $tags"
+    [ -n "$click_url" ] && headers=$'\n'"Click: $click_url"
+    
+    debug_log_message "Sending notification: $title (topic: $full_topic)"
 
-    if [ ! -z "$NTFY_USER" ] && [ ! -z "$NTFY_PASS" ]; then
-        if curl -s -u "$NTFY_USER:$NTFY_PASS" -H "$headers" -d "$message" "http://$NTFY_SERVER/$full_topic" >/dev/null; then
-            debug_log "Notification sent: $title"
-        else
-            error_log_message "Failed to send notification: $title"
-        fi
-    else 
-        if curl -s -H "$headers" -d "$message" "http://$NTFY_SERVER/$full_topic" >/dev/null; then
-            debug_log "Notification sent: $title"
-        else
-            error_log_message "Failed to send notification: $title"
-        fi
+    local auth_args=()
+    [ -n "$NTFY_USER" ] && [ -n "$NTFY_PASS" ] && auth_args+=(-u "$NTFY_USER:$NTFY_PASS")
+    
+    if curl "${curl_args[@]}" "${auth_args[@]}" \
+        -H "$(echo -e "$headers")" \
+        -d "$message" \
+        "http://$NTFY_SERVER/$full_topic" >/dev/null 2>&1; then
+        debug_log_message "Notification sent successfully: $title"
+    else
+        error_log_message "Failed to send notification: $title (topic: $full_topic)"
+        return 1
+    fi
 }
 
 get_timestamp() {
-    date --iso-8601=seconds
+    date '+%Y-%m-%d %H:%M:%S'
 }
 
 get_last_check() {
@@ -195,7 +414,7 @@ get_last_check() {
     if [ -f "$state_file" ]; then
         cat "$state_file"
     else
-        date --iso-8601=seconds --date="$CHECK_INTERVAL_HOURS hours ago"
+        date '+%Y-%m-%d %H:%M:%S' --date="$CHECK_LOG_INTERVAL_HOURS hours ago"
     fi
 }
 
@@ -205,313 +424,68 @@ update_last_check() {
     get_timestamp > "$state_file"
 }
 
-pct_command_exists() {
-    local vmid="$1"
-    local cmd="$2"
-    pct exec "$vmid" -- sh -c "command -v $cmd >/dev/null 2>&1"
-}
-
-qm_command_exists() {
-    local vmid="$1"
-    local cmd="$2"
-    qm guest exec "$vmid" -- sh -c "command -v $cmd >/dev/null 2>&1"
-}
-
-pct_safe_exec() {
-    local vmid="$1"
-    shift
-    local cmd="$*"
-    pct_command_exists "$vmid" "$(echo $cmd | awk '{print $1}')" && pct exec "$vmid" -- sh -c "$cmd"
-}
-
-qm_safe_exec() {
-    local vmid="$1"
-    shift
-    local cmd="$*"
-    qm_command_exists "$vmid" "$(echo $cmd | awk '{print $1}')" && qm guest exec "$vmid" -- sh -c "$cmd"
-}
-
-#==============================================================================
-# Monitoring Functions
-#==============================================================================
-
-monitor_host_logs() {
-    [ "$ENABLE_HOST_LOGS_MONITORING" != "true" ] && return
-    debug_log "Starting host logs monitoring"
-
-    local last_check=$(get_last_check "host_logs")
-    local errors=$(journalctl --since "$last_check" --priority=err --no-pager -q | head -20)
-    [ ! -z "$errors" ] && send_notification "high" "Host System Errors" "$errors" "system" "logs,error"
-
-    debug_log "Host logs monitoring completed"
-    update_last_check "host_logs"
-}
-
-
-monitor_guest_logs() {
-    [ "$ENABLE_GUEST_LOGS_MONITORING" != "true" ] && return
-    debug_log "Starting guest logs monitoring"
-
-    last_check=$(get_last_check "guest_logs")
-
-    # LXC containers in parallel
-    for vmid in $(pct list | awk 'NR>1 && $2=="running" {print $1}'); do
-        check_guest_logs "$vmid" "$last_check" "ct" &
+manage_parallel_jobs() {
+    local max_jobs="$1"
+    while [ $(jobs -r | wc -l) -ge "$max_jobs" ]; do
+        wait -n
     done
-
-    # QEMU guests in parallel
-    for vmid in $(qm list | awk 'NR>1 && $2=="running" {print $1}'); do
-        check_guest_logs "$vmid" "$last_check" "qemu" &
-    done
-
-    wait
-
-    update_last_check "guest_logs"
-    debug_log "Guest logs monitoring completed"
 }
 
+main() {
+    log_message "Starting monitoring for running VMs and CTs..."
 
-monitor_system() {
-    [ "$ENABLE_SYSTEM_MONITORING" != "true" ] && return
-    
-    debug_log "Starting system monitoring"
-    local last_check=$(get_last_check "system")
-    
-    # Load average
-    local load_avg=$(awk '{print $1}' /proc/loadavg)
-    local cpu_cores=$(nproc)
-    local load_threshold=$(echo "$cpu_cores * $LOAD_THRESHOLD_MULTIPLIER" | bc)
-    
-    if (( $(echo "$load_avg > $load_threshold" | bc -l) )); then
-        send_notification "high" "High System Load" "Load average: $load_avg (cores: $cpu_cores)" "system" "performance,load"
+    check_dependencies
+    validate_config
+    acquire_lock
+
+    log_message "Querying cluster resources..."
+    RESOURCES=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        error_log_message "ERROR: Failed to query resources. Ensure pvesh is available and run as root."
+        exit 1
     fi
-    
-    # CPU Temperature
-    if command -v sensors >/dev/null 2>&1; then
-        cpu_temp=$(sensors | awk '
-            /^Core [0-9]+:/ || /^Package id [0-9]+:/ {
-                gsub(/\+|°C/, "", $3); if ($3 > max) max=$3
-            } END {print max}
-        ')
-        if [ ! -z "$cpu_temp" ] && [ "$cpu_temp" -gt "$CPU_TEMP_THRESHOLD" ]; then
-            send_notification "high" "High CPU Temperature" "CPU temperature: ${cpu_temp}°C" "system" "temperature,cpu"
-        fi
+
+    if echo "$RESOURCES" | jq -e '.data' >/dev/null 2>&1; then
+        JQ_FILTER='.data[]'
+    else
+        JQ_FILTER='.[]'
     fi
-    
-    # Memory usage
-    local mem_usage=$(free | awk '/Mem:/ {printf "%.0f", ($3/$2)*100}')
-    if [ "$mem_usage" -gt "$MEM_USAGE_THRESHOLD" ]; then
-        send_notification "default" "High Memory Usage" "Memory usage: ${mem_usage}%" "system" "memory,performance"
-    fi
-    
-    # Disk temperature (all SMART disks)
-    for drive in $(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1}'); do
-        local device="/dev/$drive"
 
-        # Get temperature from multiple possible fields
-        temp=$(smartctl -A "$device" 2>/dev/null | awk '
-            /Temperature_Celsius/ || /Airflow_Temperature_Cel/ || /Temperature_Internal/ {print $10}
-        ' | head -1)
+    LAST_LOG_CHECK=$(get_last_check "guest_logs")
 
-        if [ ! -z "$temp" ] && [ "$temp" -gt 50 ]; then
-            send_notification "default" "High Drive Temperature" "Drive $device: ${temp}°C" "storage" "temperature,disk,$drive"
-        fi
-    done
-    
-    debug_log "System monitoring completed"
+    log_message "Processing VMs..."
+    echo "$RESOURCES" | jq -r "$JQ_FILTER | select(.status == \"running\" and .type == \"qemu\" and .template != 1) | \"\(.vmid)|\(.node)|\(.name)\"" | while IFS='|' read -r VMID NODE NAME; do
+        [ "$TEMPLATE" = "1" ] && continue
 
-    update_last_check "system"
-}
+        IS_WINDOWS=0
 
-monitor_disk_health() {
-    [ "$ENABLE_DISK_HEALTH_MONITORING" != "true" ] && return
-
-    debug_log "Starting disk health monitoring"
-    
-    for drive in $(lsblk -nd -o NAME,TYPE | awk '$2=="disk"{print $1}'); do
-        local device="/dev/$drive"
-        [ -z "$(smartctl -i $device 2>/dev/null | grep 'SMART support is: Available')" ] && continue
-        
-        local health=$(smartctl -H $device 2>/dev/null | awk '/SMART overall-health/ {print $6}')
-        if [ "$health" != "PASSED" ]; then
-            send_notification "max" "Disk Health Failure" "Drive $device failed SMART health check ($health)" "storage" "disk,health,$drive"
-        fi
-        
-        # Reallocated, pending, uncorrectable
-        for attr in Reallocated_Sector_Ct Current_Pending_Sector Offline_Uncorrectable; do
-            local val=$(smartctl -A $device 2>/dev/null | awk -v a="$attr" '$2==a {print $10}')
-            if [ ! -z "$val" ] && [ "$val" -gt 0 ]; then
-                send_notification "high" "Disk Alert: $attr" "Drive $device: $attr=$val" "storage" "disk,$attr,$drive"
+        if qm agent $VMID ping >/dev/null 2>&1; then
+            OS_CHECK=$(qm guest exec $VMID -- cmd /c ver 2>/dev/null)
+            if echo "$OS_CHECK" | grep -q "Microsoft Windows"; then
+                IS_WINDOWS=1
             fi
-        done
-    done
-
-    for pool in $(zpool list -H -o name); do
-        status=$(zpool status -x $pool)
-        [ "$status" != "all pools are healthy" ] && send_notification "high" "ZFS Pool Issue" "$status" "storage" "zfs,$pool"
-    done
-
-    debug_log "Disk health monitoring completed"
-    
-    update_last_check "disk_health"
-}
-
-monitor_backups() {
-    [ "$ENABLE_BACKUP_MONITORING" != "true" ] && return
-    
-    debug_log "Starting backup monitoring"
-    local last_check=$(get_last_check "backups")
-    
-    # Monitor PVE backup tasks
-    if command -v pvesh >/dev/null 2>&1; then
-        # Check recent backup tasks for failures
-        local failed_backups=$(journalctl --since "$last_check" --no-pager -q | grep -i "backup.*\(error\|failed\|abort\)")
-        
-        if [ ! -z "$failed_backups" ]; then
-            send_notification "high" "PVE Backup Failure" "$failed_backups" "backups" "proxmox,backup,failure"
         fi
-    fi
-    
-    # Monitor custom backup logs
-    for log_pattern in $BACKUP_LOG_PATHS; do
-        for backup_log in $log_pattern; do
-            [ ! -f "$backup_log" ] && continue
-            errors=$(tail -n 50 "$backup_log" | grep -iE "error|failed|abort")
-            [ ! -z "$errors" ] && send_notification "high" "Backup Error - $(basename $backup_log)" "$errors" "backups" "backup,failure"
-        done
+
+        (
+            check_guest_network "$VMID" "$NODE" "$NAME" "vm" "$IS_WINDOWS"
+            check_guest_logs "$VMID" "$NODE" "$NAME" "vm" "$IS_WINDOWS" "$LAST_LOG_CHECK"
+        ) &
+        manage_parallel_jobs "$MAX_PARALLEL_JOBS"
     done
 
-    debug_log "Backup monitoring completed"
-    
-    update_last_check "backups"
-}
-
-monitor_guest_networking() {
-    [ "$ENABLE_GUEST_NETWORK_MONITORING" != "true" ] && return
-    debug_log "Starting guest networking monitoring"
-
-    # LXC
-    for vmid in $(pct list | awk 'NR>1 && $2=="running" {print $1}'); do
-        check_guest_network "$vmid" "ct" &
-    done
-
-    # QEMU
-    for vmid in $(qm list | awk 'NR>1 && $2=="running" {print $1}'); do
-        check_guest_network "$vmid" "qemu" &
+    log_message "Processing CTs..."
+    echo "$RESOURCES" | jq -r "$JQ_FILTER | select(.status == \"running\" and .type == \"lxc\" and .template != 1) | \"\(.vmid)|\(.node)|\(.name)\"" | while IFS='|' read -r CTID NODE NAME; do
+        (
+            check_guest_network "$CTID" "$NODE" "$NAME" "ct" 0
+            check_guest_logs "$CTID" "$NODE" "$NAME" "ct" 0 "$LAST_LOG_CHECK"
+        ) &
+        manage_parallel_jobs "$MAX_PARALLEL_JOBS"
     done
 
     wait
-
-    update_last_check "guest_networking"
-    debug_log "Guest networking monitoring completed"
+    update_last_check "guest_logs"
+    log_message "Monitoring completed."
 }
 
-#==============================================================================
-# Main Execution
-#==============================================================================
-
-show_usage() {
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  --host-logs         Run only host logs monitoring"
-    echo "  --guest-logs        Run only guest logs monitoring"
-    echo "  --backup            Run only backup monitoring"
-    echo "  --disk-health       Run only disk health monitoring"
-    echo "  --system            Run only system monitoring"
-    echo "  --guest-networking  Run only guest network monitoring"
-    echo "  --test              Send test notification"
-    echo "  --debug             Enable debug logging"
-    echo "  --help              Show this help"
-    echo ""
-    echo "Configuration file: $CONFIG_FILE"
-    echo "Error log file: $ERROR_LOG_FILE"
-}
-
-# Parse command line arguments
-RUN_SPECIFIC=""
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --host-logs)
-            RUN_SPECIFIC="host_logs"
-            shift
-            ;;
-        --guest-logs)
-            RUN_SPECIFIC="guest_logs"
-            shift
-            ;;
-        --backup)
-            RUN_SPECIFIC="backup"
-            shift
-            ;;
-        --disk-health)
-            RUN_SPECIFIC="disk_health"
-            shift
-            ;;
-        --system)
-            RUN_SPECIFIC="system"
-            shift
-            ;;
-        --guest-networking)
-            RUN_SPECIFIC="guest_networking"
-            shift
-            ;;
-        --test)
-            send_notification "default" "Test Notification" "This is a test notification from $(hostname) at $(date)" "test" "test,$(hostname)"
-            exit 0
-            ;;
-        --debug)
-            DEBUG=true
-            shift
-            ;;
-        --help)
-            show_usage
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
-    esac
-done
-
-# Main execution
-debug_log "Starting ntfy monitoring run"
-
-check_dependencies
-validate_config
-
-if [ -z "$RUN_SPECIFIC" ]; then
-    # Run all monitoring functions
-    monitor_host_logs
-    monitor_guest_logs
-    monitor_disk_health
-    monitor_backups
-    monitor_system
-    monitor_guest_networking
-else
-    # Run specific monitoring function
-    case $RUN_SPECIFIC in
-        host_logs)
-            monitor_host_logs
-            ;;
-        guest_logs)
-            monitor_guest_logs
-            ;;
-        backup)
-            monitor_backups
-            ;;
-        disk_health)
-            monitor_disk_health
-            ;;
-        system)
-            monitor_system
-            ;;
-        guest_networking)
-            monitor_guest_networking
-            ;;
-    esac
-fi
-
-debug_log "Monitoring run completed"
+main
