@@ -16,7 +16,7 @@ mkdir -p "$STATE_DIR"
 
 # Default configuration (can be overridden in config file)
 GUEST_PING_TIMEOUT=5
-GUEST_PING_RETRY_COUNT=2
+GUEST_PING_COUNT=2
 CHECK_LOG_INTERVAL_HOURS=1  # Time window for log checks
 PING_TARGETS="8.8.8.8 1.1.1.1"
 NSLOOKUP_TARGET="google.com"
@@ -75,13 +75,13 @@ check_network_tools() {
     # Check for ping
     if [ "$TYPE" = "vm" ]; then
         PING_CHECK=$(qm guest exec $ID -- sh -c "command -v ping" 2>/dev/null)
-        PING_EXIT=$?
+        PING_EXIT=$(echo "$PING_CHECK" | jq -r '.exitcode')
     else
         PING_CHECK=$(pct exec $ID -- sh -c "command -v ping" 2>/dev/null)
-        PING_EXIT=$?
+        PING_EXIT=$?  # pct exec does not return JSON, so use shell exit code
     fi
     
-    if [ $PING_EXIT -ne 0 ] || [ -z "$PING_CHECK" ]; then
+    if [ "$PING_EXIT" -ne 0 ] || [ -z "$PING_CHECK" ]; then
         error_log_message "$TYPE $ID: ping not found"
         send_notification "urgent" "$TYPE $ID Tool Missing" "$TYPE $ID ($NAME): ping not found." "guest-network" "error,$TYPE,$NAME"
         return $PING_EXIT
@@ -90,13 +90,13 @@ check_network_tools() {
     # Check for nslookup
     if [ "$TYPE" = "vm" ]; then
         NSLOOKUP_CHECK=$(qm guest exec $ID -- sh -c "command -v nslookup" 2>/dev/null)
-        NSLOOKUP_EXIT=$?
+        NSLOOKUP_EXIT=$(echo "$NSLOOKUP_CHECK" | jq -r '.exitcode')
     else
         NSLOOKUP_CHECK=$(pct exec $ID -- sh -c "command -v nslookup" 2>/dev/null)
         NSLOOKUP_EXIT=$?
     fi
     
-    if [ $NSLOOKUP_EXIT -ne 0 ] || [ -z "$NSLOOKUP_CHECK" ]; then
+    if [ "$NSLOOKUP_EXIT" -ne 0 ] || [ -z "$NSLOOKUP_CHECK" ]; then
         error_log_message "$TYPE $ID: nslookup not found"
         send_notification "urgent" "$TYPE $ID Tool Missing" "$TYPE $ID ($NAME): nslookup not found." "guest-network" "error,$TYPE,$NAME"
         return $NSLOOKUP_EXIT
@@ -118,13 +118,13 @@ check_log_tools() {
     for tool in grep awk; do
         if [ "$TYPE" = "vm" ]; then
             TOOL_CHECK=$(qm guest exec $ID -- sh -c "command -v $tool" 2>/dev/null)
-            TOOL_EXIT=$?
+            TOOL_EXIT=$(echo "$TOOL_CHECK" | jq -r '.exitcode')
         else
             TOOL_CHECK=$(pct exec $ID -- sh -c "command -v $tool" 2>/dev/null)
             TOOL_EXIT=$?
         fi
         
-        if [ $TOOL_EXIT -ne 0 ] || [ -z "$TOOL_CHECK" ]; then
+        if [ "$TOOL_EXIT" -ne 0 ] || [ -z "$TOOL_CHECK" ]; then
             error_log_message "$TYPE $ID: $tool not found"
             send_notification "urgent" "$TYPE $ID Tool Missing" "$TYPE $ID ($NAME): $tool not found." "guest-logs" "error,$TYPE,$NAME"
             return 1
@@ -275,28 +275,29 @@ check_guest_network() {
 
         if [ "$TYPE" = "vm" ] && [ "$IS_WINDOWS" -eq 1 ]; then
             # Windows: Use loop for ping -n
-            local attempt=0
-            while [ $attempt -lt $GUEST_PING_RETRY_COUNT ]; do
+            local i=0
+            while [ $i -lt $GUEST_PING_COUNT ]; do
                 PING_RESULT=$(qm guest exec $VMID -- cmd /c ping -n 1 -w $((GUEST_PING_TIMEOUT*1000)) $target 2>&1)
                 PING_EXIT=$?
                 if [ $PING_EXIT -eq 0 ] && echo "$PING_RESULT" | grep -q "Reply from"; then
                     PING_SUCCESS=1
                     break
                 fi
-                attempt=$((attempt + 1))
-                debug_log_message "  $TYPE $VMID: Ping attempt $attempt to $target failed - $PING_RESULT"
+                i=$((i + 1))
+                debug_log_message "  $TYPE $VMID: Ping iteration $i to $target failed - $PING_RESULT"
                 sleep 1
             done
         else
             # Linux: Use ping -c
             if [ "$TYPE" = "vm" ]; then
-                PING_RESULT=$(qm guest exec $VMID -- ping -c $GUEST_PING_RETRY_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
+                PING_RESULT=$(qm guest exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
                 PING_EXIT=$?
             else
-                PING_RESULT=$(pct exec $VMID -- ping -c $GUEST_PING_RETRY_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
+                PING_RESULT=$(pct exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
                 PING_EXIT=$?
             fi
-            if [ $PING_EXIT -eq 0 ] && echo "$PING_RESULT" | grep -q "1 packets transmitted, 1 received\|[1-9][0-9]* received"; then
+            
+            if [ $PING_EXIT -eq 0 ] && echo "$PING_RESULT" | grep -q "$GUEST_PING_COUNT packets transmitted, $GUEST_PING_COUNT received\|[1-9][0-9]* received"; then
                 PING_SUCCESS=1
             else
                 debug_log_message "  $TYPE $VMID: Ping to $target failed - $PING_RESULT"
