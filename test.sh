@@ -290,14 +290,14 @@ check_guest_network() {
         else
             # Linux: Use ping -c
             if [ "$TYPE" = "vm" ]; then
-                PING_RESULT=$(qm guest exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
+                qm guest exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1
                 PING_EXIT=$?
             else
-                PING_RESULT=$(pct exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1)
+                pct exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1
                 PING_EXIT=$?
             fi
             
-            if [ $PING_EXIT -eq 0 ] && echo "$PING_RESULT" | grep -q "$GUEST_PING_COUNT packets transmitted, $GUEST_PING_COUNT received\|[1-9][0-9]* received"; then
+            if [ $PING_EXIT -eq 0 ]; then
                 PING_SUCCESS=1
             else
                 debug_log_message "  $TYPE $VMID: Ping to $target failed - $PING_RESULT"
