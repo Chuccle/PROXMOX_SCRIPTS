@@ -290,10 +290,10 @@ check_guest_network() {
         else
             # Linux: Use ping -c
             if [ "$TYPE" = "vm" ]; then
-                qm guest exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1
+                qm guest exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target > /dev/null 2>&1
                 PING_EXIT=$?
             else
-                pct exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target 2>&1
+                pct exec $VMID -- ping -c $GUEST_PING_COUNT -W $GUEST_PING_TIMEOUT $target > /dev/null 2>&1
                 PING_EXIT=$?
             fi
             
