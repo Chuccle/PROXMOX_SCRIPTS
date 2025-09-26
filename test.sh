@@ -357,7 +357,7 @@ check_guest_network() {
         fi
         
         if [ $? -eq 0 ] && [ -n "$NSLOOKUP_RESULT" ]; then
-            local DNS_OUTPUT=$(echo "$NSLOOKUP_RESULT" | jq -r '.["out-data"] // empty')
+            local DNS_OUTPUT=$(echo "$NSLOOKUP_RESULT" | jq -r '.exitcode // 1')
             if echo "$DNS_OUTPUT" | grep -q "$NSLOOKUP_TARGET\|Address:\|[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+"; then
                 DNS_SUCCESS=1
                 debug_log_message "  $TYPE $VMID: DNS resolution SUCCESS"
